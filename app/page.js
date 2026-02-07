@@ -14,7 +14,15 @@ function formatTime(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-const OPENAI_VOICES = ['nova', 'alloy', 'echo', 'fable', 'onyx', 'shimmer'];
+const NEURAL2_VOICES = [
+  { id: 'en-US-Neural2-F', label: 'Aria (F)' },
+  { id: 'en-US-Neural2-C', label: 'Bella (F)' },
+  { id: 'en-US-Neural2-H', label: 'Clara (F)' },
+  { id: 'en-US-Neural2-D', label: 'David (M)' },
+  { id: 'en-US-Neural2-A', label: 'Adam (M)' },
+  { id: 'en-US-Neural2-J', label: 'James (M)' },
+  { id: 'en-US-Neural2-I', label: 'Ian (M)' },
+];
 const PREFETCH_AHEAD = 3;
 
 export default function VoiceReader() {
@@ -24,7 +32,7 @@ export default function VoiceReader() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [speed, setSpeed] = useState(1.0);
-  const [selectedVoice, setSelectedVoice] = useState('nova');
+  const [selectedVoice, setSelectedVoice] = useState('en-US-Neural2-F');
   const [showSettings, setShowSettings] = useState(false);
   const [showText, setShowText] = useState(true);
   const [estimatedTotal, setEstimatedTotal] = useState(0);
@@ -41,7 +49,7 @@ export default function VoiceReader() {
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
   const speedRef = useRef(1.0);
-  const selectedVoiceRef = useRef('nova');
+  const selectedVoiceRef = useRef('en-US-Neural2-F');
   const timerRef = useRef(null);
   const startTimeRef = useRef(null);
   const sentencesRef = useRef([]);
@@ -555,8 +563,8 @@ export default function VoiceReader() {
                 fontFamily: "'IBM Plex Sans', sans-serif",
               }}
             >
-              {OPENAI_VOICES.map(v => (
-                <option key={v} value={v}>{v.charAt(0).toUpperCase() + v.slice(1)}</option>
+              {NEURAL2_VOICES.map(v => (
+                <option key={v.id} value={v.id}>{v.label}</option>
               ))}
             </select>
           </div>

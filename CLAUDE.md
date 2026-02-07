@@ -5,13 +5,13 @@ A mobile-first PWA for reading text aloud with sentence-level navigation. Built 
 ## Stack
 - Next.js 14 (App Router)
 - React 18
-- OpenAI TTS API (model: `tts-1`) for audio generation
+- Google Cloud Text-to-Speech API (Neural2 voices) for audio generation
 - No CSS framework — inline styles, IBM Plex Sans/Mono fonts via Google Fonts
 - Deployed on Vercel
 
 ## Architecture
 - `app/page.js` — Single-page client component. The entire app lives here.
-- `app/api/tts/route.js` — API route that proxies requests to OpenAI's TTS API. Accepts POST `{ text, voice, speed }`, returns mp3 audio stream.
+- `app/api/tts/route.js` — API route that proxies requests to Google Cloud TTS REST API. Accepts POST `{ text, voice, speed }`, returns mp3 audio stream.
 - `app/layout.js` — Root layout with PWA meta tags.
 - `public/manifest.json` — PWA manifest (standalone mode, portrait orientation).
 - `public/sw.js` — Service worker (network-first caching strategy).
@@ -19,17 +19,23 @@ A mobile-first PWA for reading text aloud with sentence-level navigation. Built 
 
 ## How It Works
 - User pastes text, presses play.
-- Text is split into sentences. Each sentence is sent to `/api/tts` which calls OpenAI's TTS API.
+- Text is split into sentences. Each sentence is sent to `/api/tts` which calls Google Cloud TTS.
 - Audio is returned as mp3 and played via an `<audio>` element — this enables lock-screen playback on iOS.
 - Next 3 sentences are prefetched while the current one plays (no gaps between sentences).
 - Media Session API (`navigator.mediaSession`) provides play/pause/skip controls on the iOS lock screen.
 - Sentence-level skip forward/back, tap-to-jump, progress bar scrubbing.
 - Speed control: 0.75× to 2×, adjustable mid-playback.
-- Voice selection: 6 OpenAI voices (nova, alloy, echo, fable, onyx, shimmer). Default: nova.
+- Voice selection: 7 Google Neural2 voices (4 female, 3 male). Default: Aria (en-US-Neural2-F).
 - Falls back to Web Speech API (`speechSynthesis`) if the TTS API call fails.
 
 ## Environment Variables
-- `OPENAI_API_KEY` — Required. Your OpenAI API key for TTS generation.
+- `GOOGLE_CLOUD_API_KEY` — Required. A Google Cloud API key with Text-to-Speech API enabled.
+
+## Google Cloud Setup
+1. Go to Google Cloud Console → APIs & Services → Enable "Cloud Text-to-Speech API"
+2. Go to Credentials → Create API Key
+3. (Recommended) Restrict the key to only "Cloud Text-to-Speech API"
+4. Set the key as `GOOGLE_CLOUD_API_KEY` in Vercel environment variables
 
 ## Design
 - Dark theme (#0a0a0b background), warm accent (#c45a3c).
@@ -38,6 +44,7 @@ A mobile-first PWA for reading text aloud with sentence-level navigation. Built 
 
 ## Known Limitations
 - Each sentence is a separate TTS API call. Very long texts with many sentences will make many API calls. Prefetching mitigates perceived latency.
+- Neural2 voices: 1M characters/month free, then $16/1M characters.
 - Clipboard API requires HTTPS and a user gesture on iOS.
 - When falling back to speechSynthesis (API unavailable), iOS Safari may still suspend audio on lock.
 
