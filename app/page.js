@@ -14,6 +14,9 @@ function formatTime(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+const OPENAI_VOICES = ['nova', 'alloy', 'echo', 'fable', 'onyx', 'shimmer'];
+const PREFETCH_AHEAD = 3;
+
 export default function VoiceReader() {
   const [text, setText] = useState('');
   const [sentences, setSentences] = useState([]);
@@ -21,33 +24,48 @@ export default function VoiceReader() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [speed, setSpeed] = useState(1.0);
-  const [voices, setVoices] = useState([]);
-  const [selectedVoice, setSelectedVoice] = useState(null);
+  const [selectedVoice, setSelectedVoice] = useState('nova');
   const [showSettings, setShowSettings] = useState(false);
   const [showText, setShowText] = useState(true);
   const [estimatedTotal, setEstimatedTotal] = useState(0);
   const [elapsedTime, setElapsedTime] = useState(0);
   const [isStandalone, setIsStandalone] = useState(false);
+  const [useFallback, setUseFallback] = useState(false);
+
+  // Refs for speechSynthesis fallback
+  const [webVoices, setWebVoices] = useState([]);
+  const [selectedWebVoice, setSelectedWebVoice] = useState(null);
 
   const sentenceRefs = useRef([]);
-  const utteranceRef = useRef(null);
   const currentIndexRef = useRef(-1);
   const isPlayingRef = useRef(false);
+  const isPausedRef = useRef(false);
   const speedRef = useRef(1.0);
-  const selectedVoiceRef = useRef(null);
-  const audioContextRef = useRef(null);
+  const selectedVoiceRef = useRef('nova');
   const timerRef = useRef(null);
   const startTimeRef = useRef(null);
   const sentencesRef = useRef([]);
+
+  // Audio element refs
+  const audioRef = useRef(null);
+  const audioCacheRef = useRef(new Map()); // index -> blob URL
+  const prefetchingRef = useRef(new Set()); // indices currently being fetched
+  const abortControllerRef = useRef(null);
+
+  // SpeechSynthesis fallback refs
+  const utteranceRef = useRef(null);
+  const selectedWebVoiceRef = useRef(null);
 
   // Keep refs in sync
   useEffect(() => { speedRef.current = speed; }, [speed]);
   useEffect(() => { selectedVoiceRef.current = selectedVoice; }, [selectedVoice]);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+  useEffect(() => { isPausedRef.current = isPaused; }, [isPaused]);
   useEffect(() => { currentIndexRef.current = currentIndex; }, [currentIndex]);
   useEffect(() => { sentencesRef.current = sentences; }, [sentences]);
+  useEffect(() => { selectedWebVoiceRef.current = selectedWebVoice; }, [selectedWebVoice]);
 
-  // Detect standalone (Add to Home Screen) mode
+  // Detect standalone mode
   useEffect(() => {
     setIsStandalone(
       window.matchMedia('(display-mode: standalone)').matches ||
@@ -55,16 +73,26 @@ export default function VoiceReader() {
     );
   }, []);
 
-  // Load voices
+  // Create persistent audio element
+  useEffect(() => {
+    const audio = new Audio();
+    audio.preload = 'auto';
+    audioRef.current = audio;
+    return () => {
+      audio.pause();
+      audio.src = '';
+    };
+  }, []);
+
+  // Load speechSynthesis voices for fallback
   useEffect(() => {
     const synth = window.speechSynthesis;
     if (!synth) return;
-
     const loadVoices = () => {
       const v = synth.getVoices();
       const english = v.filter(voice => voice.lang.startsWith('en'));
-      setVoices(english.length > 0 ? english : v);
-      if (!selectedVoice && v.length > 0) {
+      setWebVoices(english.length > 0 ? english : v);
+      if (!selectedWebVoice && v.length > 0) {
         const preferred =
           v.find(voice => voice.lang.startsWith('en') && (
             voice.name.includes('Samantha') ||
@@ -74,18 +102,17 @@ export default function VoiceReader() {
           )) ||
           v.find(voice => voice.lang.startsWith('en')) ||
           v[0];
-        setSelectedVoice(preferred);
+        setSelectedWebVoice(preferred);
       }
     };
-
     loadVoices();
     synth.addEventListener?.('voiceschanged', loadVoices);
     return () => synth.removeEventListener?.('voiceschanged', loadVoices);
   }, []);
 
-  // iOS Safari workaround: keep speechSynthesis alive
-  // Safari pauses speechSynthesis after ~15s. This nudges it.
+  // iOS Safari workaround for speechSynthesis fallback
   useEffect(() => {
+    if (!useFallback) return;
     let interval;
     if (isPlaying) {
       interval = setInterval(() => {
@@ -96,7 +123,7 @@ export default function VoiceReader() {
       }, 10000);
     }
     return () => clearInterval(interval);
-  }, [isPlaying]);
+  }, [isPlaying, useFallback]);
 
   // Estimate total listening time
   useEffect(() => {
@@ -129,7 +156,143 @@ export default function VoiceReader() {
     }
   }, [currentIndex]);
 
-  const speakSentence = useCallback((index, sentenceList) => {
+  // Media Session API for lock screen controls
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: 'Voice Reader',
+      artist: currentIndex >= 0 && sentences[currentIndex]
+        ? sentences[currentIndex].slice(0, 60) + (sentences[currentIndex].length > 60 ? '...' : '')
+        : 'Paste → Listen',
+    });
+
+    navigator.mediaSession.setActionHandler('play', () => {
+      if (isPausedRef.current) handleResume();
+    });
+    navigator.mediaSession.setActionHandler('pause', () => {
+      if (isPlayingRef.current) handlePause();
+    });
+    navigator.mediaSession.setActionHandler('nexttrack', () => {
+      handleSkipForward();
+    });
+    navigator.mediaSession.setActionHandler('previoustrack', () => {
+      handleSkipBack();
+    });
+  }, [currentIndex, sentences]);
+
+  // Cleanup audio cache when sentences change
+  useEffect(() => {
+    return () => {
+      audioCacheRef.current.forEach(url => URL.revokeObjectURL(url));
+      audioCacheRef.current.clear();
+      prefetchingRef.current.clear();
+    };
+  }, [sentences]);
+
+  // --- TTS fetch ---
+  const fetchTTSAudio = useCallback(async (index, sentenceList, signal) => {
+    const list = sentenceList || sentencesRef.current;
+    if (index < 0 || index >= list.length) return null;
+    if (audioCacheRef.current.has(index)) return audioCacheRef.current.get(index);
+    if (prefetchingRef.current.has(index)) {
+      // Wait for ongoing fetch to complete
+      while (prefetchingRef.current.has(index)) {
+        await new Promise(r => setTimeout(r, 50));
+        if (signal?.aborted) return null;
+      }
+      return audioCacheRef.current.get(index) || null;
+    }
+
+    prefetchingRef.current.add(index);
+    try {
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: list[index],
+          voice: selectedVoiceRef.current,
+          speed: speedRef.current,
+        }),
+        signal,
+      });
+      if (!res.ok) throw new Error(`TTS API returned ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      audioCacheRef.current.set(index, url);
+      return url;
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        console.warn('TTS fetch failed for sentence', index, err.message);
+      }
+      return null;
+    } finally {
+      prefetchingRef.current.delete(index);
+    }
+  }, []);
+
+  // Prefetch upcoming sentences
+  const prefetchAhead = useCallback((fromIndex, sentenceList) => {
+    const list = sentenceList || sentencesRef.current;
+    for (let i = 1; i <= PREFETCH_AHEAD; i++) {
+      const idx = fromIndex + i;
+      if (idx < list.length && !audioCacheRef.current.has(idx) && !prefetchingRef.current.has(idx)) {
+        fetchTTSAudio(idx, list).catch(() => {});
+      }
+    }
+  }, [fetchTTSAudio]);
+
+  // --- Audio element playback ---
+  const playAudioSentence = useCallback(async (index, sentenceList) => {
+    const list = sentenceList || sentencesRef.current;
+    if (index >= list.length) {
+      setIsPlaying(false);
+      setIsPaused(false);
+      setCurrentIndex(-1);
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
+      return;
+    }
+
+    setCurrentIndex(index);
+    prefetchAhead(index, list);
+
+    const audioUrl = await fetchTTSAudio(index, list);
+    if (!audioUrl) {
+      // Fallback to speechSynthesis for this sentence
+      console.warn('Falling back to speechSynthesis for sentence', index);
+      speakSentenceFallback(index, list);
+      return;
+    }
+
+    const audio = audioRef.current;
+    audio.src = audioUrl;
+
+    audio.onended = () => {
+      if (isPlayingRef.current) {
+        const next = currentIndexRef.current + 1;
+        playAudioSentence(next, list);
+      }
+    };
+
+    audio.onerror = () => {
+      if (isPlayingRef.current) {
+        console.warn('Audio playback error, trying next sentence');
+        const next = currentIndexRef.current + 1;
+        playAudioSentence(next, list);
+      }
+    };
+
+    try {
+      await audio.play();
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+    } catch (err) {
+      console.warn('Audio play failed:', err.message);
+      speakSentenceFallback(index, list);
+    }
+  }, [fetchTTSAudio, prefetchAhead]);
+
+  // --- SpeechSynthesis fallback ---
+  const speakSentenceFallback = useCallback((index, sentenceList) => {
     const list = sentenceList || sentencesRef.current;
     if (index >= list.length) {
       setIsPlaying(false);
@@ -138,17 +301,19 @@ export default function VoiceReader() {
       return;
     }
 
+    setUseFallback(true);
     window.speechSynthesis.cancel();
 
     const utterance = new SpeechSynthesisUtterance(list[index]);
     utterance.rate = speedRef.current;
-    if (selectedVoiceRef.current) utterance.voice = selectedVoiceRef.current;
+    if (selectedWebVoiceRef.current) utterance.voice = selectedWebVoiceRef.current;
 
     utterance.onend = () => {
       if (isPlayingRef.current) {
         const next = currentIndexRef.current + 1;
         setCurrentIndex(next);
-        speakSentence(next, list);
+        // Try TTS again for next sentence
+        playAudioSentence(next, list);
       }
     };
 
@@ -156,74 +321,135 @@ export default function VoiceReader() {
       if (e.error !== 'canceled' && isPlayingRef.current) {
         const next = currentIndexRef.current + 1;
         setCurrentIndex(next);
-        speakSentence(next, list);
+        playAudioSentence(next, list);
       }
     };
 
     utteranceRef.current = utterance;
     setCurrentIndex(index);
     window.speechSynthesis.speak(utterance);
-  }, []);
+  }, [playAudioSentence]);
 
-  const handlePlay = () => {
+  // --- Controls ---
+  const handlePlay = useCallback(() => {
     if (!text.trim()) return;
     const s = splitIntoSentences(text);
     setSentences(s);
+    setUseFallback(false);
+
+    // Clear old cache
+    audioCacheRef.current.forEach(url => URL.revokeObjectURL(url));
+    audioCacheRef.current.clear();
+    prefetchingRef.current.clear();
 
     if (isPaused && currentIndexRef.current >= 0) {
       setIsPaused(false);
       setIsPlaying(true);
       if (!startTimeRef.current) startTimeRef.current = Date.now();
-      speakSentence(currentIndexRef.current, s);
+      playAudioSentence(currentIndexRef.current, s);
     } else {
       setIsPlaying(true);
       setIsPaused(false);
       setElapsedTime(0);
       startTimeRef.current = Date.now();
-      speakSentence(0, s);
+      playAudioSentence(0, s);
       setShowText(true);
     }
-  };
+  }, [text, isPaused, playAudioSentence]);
 
-  const handlePause = () => {
-    window.speechSynthesis.cancel();
+  const handleResume = useCallback(() => {
+    setIsPaused(false);
+    setIsPlaying(true);
+    if (useFallback) {
+      speakSentenceFallback(currentIndexRef.current);
+    } else {
+      playAudioSentence(currentIndexRef.current);
+    }
+  }, [useFallback, playAudioSentence, speakSentenceFallback]);
+
+  const handlePause = useCallback(() => {
+    if (useFallback) {
+      window.speechSynthesis.cancel();
+    } else if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.onended = null;
+    }
     setIsPaused(true);
     setIsPlaying(false);
-  };
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+  }, [useFallback]);
 
-  const handleStop = () => {
-    window.speechSynthesis.cancel();
+  const handleStop = useCallback(() => {
+    if (useFallback) {
+      window.speechSynthesis.cancel();
+    }
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.onended = null;
+      audioRef.current.src = '';
+    }
     setIsPlaying(false);
     setIsPaused(false);
     setCurrentIndex(-1);
     setElapsedTime(0);
     startTimeRef.current = null;
-  };
+    setUseFallback(false);
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
+  }, [useFallback]);
 
-  const handleSkipForward = () => {
-    if (!isPlaying && !isPaused) return;
-    const next = Math.min(currentIndexRef.current + 1, sentences.length - 1);
-    window.speechSynthesis.cancel();
+  const handleSkipForward = useCallback(() => {
+    if (!isPlayingRef.current && !isPausedRef.current) return;
+    const next = Math.min(currentIndexRef.current + 1, sentencesRef.current.length - 1);
+    if (useFallback) window.speechSynthesis.cancel();
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current.onended = null; }
     setCurrentIndex(next);
-    if (isPlaying) speakSentence(next);
-  };
+    if (isPlayingRef.current) playAudioSentence(next);
+  }, [useFallback, playAudioSentence]);
 
-  const handleSkipBack = () => {
-    if (!isPlaying && !isPaused) return;
+  const handleSkipBack = useCallback(() => {
+    if (!isPlayingRef.current && !isPausedRef.current) return;
     const prev = Math.max(currentIndexRef.current - 1, 0);
-    window.speechSynthesis.cancel();
+    if (useFallback) window.speechSynthesis.cancel();
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current.onended = null; }
     setCurrentIndex(prev);
-    if (isPlaying) speakSentence(prev);
-  };
+    if (isPlayingRef.current) playAudioSentence(prev);
+  }, [useFallback, playAudioSentence]);
 
-  const handleSentenceTap = (index) => {
-    if (!isPlaying && !isPaused) return;
-    window.speechSynthesis.cancel();
+  const handleSentenceTap = useCallback((index) => {
+    if (!isPlayingRef.current && !isPausedRef.current) return;
+    if (useFallback) window.speechSynthesis.cancel();
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current.onended = null; }
     setCurrentIndex(index);
     setIsPaused(false);
     setIsPlaying(true);
-    speakSentence(index);
-  };
+    playAudioSentence(index);
+  }, [useFallback, playAudioSentence]);
+
+  const handleSkip5 = useCallback(() => {
+    const jump = Math.min(currentIndexRef.current + 5, sentencesRef.current.length - 1);
+    if (useFallback) window.speechSynthesis.cancel();
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current.onended = null; }
+    setCurrentIndex(jump);
+    if (isPlayingRef.current) playAudioSentence(jump);
+  }, [useFallback, playAudioSentence]);
+
+  const handleSpeedChange = useCallback((s) => {
+    setSpeed(s);
+    // Clear cache since speed changed -> audio needs re-generation
+    audioCacheRef.current.forEach(url => URL.revokeObjectURL(url));
+    audioCacheRef.current.clear();
+    prefetchingRef.current.clear();
+    if (isPlaying && currentIndexRef.current >= 0) {
+      if (useFallback) {
+        window.speechSynthesis.cancel();
+        setTimeout(() => speakSentenceFallback(currentIndexRef.current), 50);
+      } else {
+        if (audioRef.current) { audioRef.current.pause(); audioRef.current.onended = null; }
+        // speed ref will be updated by the effect, slight delay to ensure sync
+        setTimeout(() => playAudioSentence(currentIndexRef.current), 50);
+      }
+    }
+  }, [isPlaying, useFallback, playAudioSentence, speakSentenceFallback]);
 
   const progress = sentences.length > 0 && currentIndex >= 0
     ? ((currentIndex + 1) / sentences.length) * 100
@@ -310,10 +536,13 @@ export default function VoiceReader() {
               Voice
             </label>
             <select
-              value={selectedVoice?.name || ''}
+              value={selectedVoice}
               onChange={(e) => {
-                const v = voices.find(v => v.name === e.target.value);
-                setSelectedVoice(v);
+                setSelectedVoice(e.target.value);
+                // Clear cache since voice changed
+                audioCacheRef.current.forEach(url => URL.revokeObjectURL(url));
+                audioCacheRef.current.clear();
+                prefetchingRef.current.clear();
               }}
               style={{
                 width: '100%',
@@ -326,8 +555,8 @@ export default function VoiceReader() {
                 fontFamily: "'IBM Plex Sans', sans-serif",
               }}
             >
-              {voices.map(v => (
-                <option key={v.name} value={v.name}>{v.name}</option>
+              {OPENAI_VOICES.map(v => (
+                <option key={v} value={v}>{v.charAt(0).toUpperCase() + v.slice(1)}</option>
               ))}
             </select>
           </div>
@@ -348,7 +577,7 @@ export default function VoiceReader() {
               {speeds.map(s => (
                 <button
                   key={s}
-                  onClick={() => setSpeed(s)}
+                  onClick={() => handleSpeedChange(s)}
                   style={{
                     flex: 1,
                     padding: '8px 0',
@@ -367,6 +596,20 @@ export default function VoiceReader() {
               ))}
             </div>
           </div>
+
+          {useFallback && (
+            <div style={{
+              marginTop: 12,
+              padding: '8px 12px',
+              background: 'rgba(196, 90, 60, 0.15)',
+              borderRadius: 6,
+              fontSize: 12,
+              color: '#c45a3c',
+              fontFamily: "'IBM Plex Mono', monospace",
+            }}>
+              Using device voice (API unavailable)
+            </div>
+          )}
         </div>
       )}
 
@@ -548,13 +791,7 @@ export default function VoiceReader() {
             {speeds.map(s => (
               <button
                 key={s}
-                onClick={() => {
-                  setSpeed(s);
-                  if (isPlaying && currentIndexRef.current >= 0) {
-                    window.speechSynthesis.cancel();
-                    setTimeout(() => speakSentence(currentIndexRef.current), 50);
-                  }
-                }}
+                onClick={() => handleSpeedChange(s)}
                 style={{
                   padding: '4px 10px',
                   background: speed === s ? '#c45a3c' : 'transparent',
@@ -599,7 +836,7 @@ export default function VoiceReader() {
           )}
 
           <button
-            onClick={isPlaying ? handlePause : handlePlay}
+            onClick={isPlaying ? handlePause : (isPaused ? handleResume : handlePlay)}
             disabled={!text.trim() && !isPaused}
             style={{
               width: 64, height: 64, borderRadius: '50%',
@@ -623,12 +860,7 @@ export default function VoiceReader() {
 
           {(isPlaying || isPaused) && (
             <button
-              onClick={() => {
-                const jump = Math.min(currentIndexRef.current + 5, sentences.length - 1);
-                window.speechSynthesis.cancel();
-                setCurrentIndex(jump);
-                if (isPlaying) speakSentence(jump);
-              }}
+              onClick={handleSkip5}
               title="Skip 5" style={{
                 width: 44, height: 44, borderRadius: '50%',
                 background: '#1a1a1c', border: '1px solid #2a2a2d',
