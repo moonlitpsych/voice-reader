@@ -4,7 +4,7 @@ enum VoiceMapping {
     struct VoiceOption: Identifiable {
         let id: String // AVSpeechSynthesisVoice.identifier
         let name: String
-        let quality: AVSpeechSynthesisVoice.Quality
+        let quality: AVSpeechSynthesisVoiceQuality
         let language: String
 
         var qualityLabel: String {

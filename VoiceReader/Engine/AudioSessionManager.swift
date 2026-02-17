@@ -8,7 +8,7 @@ final class AudioSessionManager {
     func configure() {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playback, mode: .spokenContent, options: [])
+            try session.setCategory(.playback, mode: .spokenAudio, options: [])
             try session.setActive(true)
         } catch {
             print("AudioSession configuration failed: \(error)")

@@ -139,7 +139,9 @@ final class SpeechEngine: NSObject {
     }
 
     func changeSpeed(_ multiplier: Double) {
-        settings.speedMultiplier = multiplier
+        if settings.speedMultiplier != multiplier {
+            settings.speedMultiplier = multiplier
+        }
         guard isPlaying, !isPaused else { return }
         // Restart current sentence at new speed
         isSpeakingAfterSkip = true
@@ -148,7 +150,9 @@ final class SpeechEngine: NSObject {
     }
 
     func changeVoice(_ identifier: String) {
-        settings.voiceIdentifier = identifier
+        if settings.voiceIdentifier != identifier {
+            settings.voiceIdentifier = identifier
+        }
         guard isPlaying, !isPaused else { return }
         isSpeakingAfterSkip = true
         synthesizer.stopSpeaking(at: .immediate)
@@ -302,14 +306,18 @@ final class SpeechEngine: NSObject {
 extension SpeechEngine: AVSpeechSynthesizerDelegate {
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
                            didFinish utterance: AVSpeechUtterance) {
-        // didFinish fires for both natural completion and stopSpeaking().
-        // If we stopped for a skip/speed change, isSpeakingAfterSkip is true
-        // and speakCurrent() was already called — don't advance again.
-        if isSpeakingAfterSkip {
-            isSpeakingAfterSkip = false
-            return
+        // Ensure we're on the main thread for @Observable property mutations
+        let work = { [self] in
+            // didFinish fires for both natural completion and stopSpeaking().
+            // If we stopped for a skip/speed change, isSpeakingAfterSkip is true
+            // and speakCurrent() was already called — don't advance again.
+            if isSpeakingAfterSkip {
+                isSpeakingAfterSkip = false
+                return
+            }
+            advanceToNext()
         }
-        advanceToNext()
+        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
